@@ -5,7 +5,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "user_state.json"
@@ -58,7 +58,7 @@ def list_history() -> list[dict[str, Any]]:
     return load_state()["history"]
 
 
-def get_history_item(history_id: str) -> dict[str, Any] | None:
+def get_history_item(history_id: str) -> Optional[Dict[str, Any]]:
     for item in load_state()["history"]:
         if item.get("id") == history_id:
             return item
@@ -76,7 +76,7 @@ def delete_history_item(history_id: str) -> bool:
     return changed
 
 
-def add_favorite(history_id: str, note: str = "") -> dict[str, Any] | None:
+def add_favorite(history_id: str, note: str = "") -> Optional[Dict[str, Any]]:
     state = load_state()
     history = next((h for h in state["history"] if h.get("id") == history_id), None)
     if history is None:
