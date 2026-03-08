@@ -50,6 +50,26 @@ uvicorn app.main:app --reload
 - 当前历史/收藏使用 `data/user_state.json` 本地文件存储；在云端免费实例重启或重建后可能丢失。
 - 若需要持久化，建议下一步接入 SQLite/PostgreSQL。
 
+## 小红书实时数据（部署版）
+当前版本支持“实时数据 + 自动降级”：
+- 当 Playwright 或 cookies 不可用时：自动回退样本数据，不影响报告生成。
+- 当 Playwright + cookies 可用时：使用小红书实时搜索结果。
+
+### Render 必配项
+1. `requirements.txt` 已包含 `playwright`。
+2. `render.yaml` 已在构建阶段安装 Chromium 浏览器。
+3. 在 Render 服务的 Environment 添加：
+   - `XHS_COOKIES_JSON`：填入 cookies 的 JSON 数组字符串（推荐）
+
+可选项：
+- `XHS_COOKIES_PATH`：若你用文件挂载方式，指定 cookies 文件路径。
+
+### 快速自检
+- `GET /api/status`
+  - 看 `xiaohongshu.playwright_available` 是否为 `true`
+  - 看 `xiaohongshu.cookies_loaded` 是否为 `true`
+  - 若两者均为 `true`，前端“检查小红书连接”会显示已连接
+
 ## 测试
 ```bash
 pytest -q

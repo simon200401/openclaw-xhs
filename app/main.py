@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.exporter import report_to_markdown
@@ -20,15 +21,29 @@ from src.state_store import (
     list_history,
     remove_favorite,
 )
+from src.xiaohongshu_client import (
+    search_xiaohongshu,
+    check_mcp_status,
+    transform_posts_for_platform
+)
 
+app = FastAPI(title="岗位定制化面试情报平台", version="0.3.0")
 
-app = FastAPI(title="岗位定制化面试情报平台", version="0.2.0")
+# 添加CORS支持
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class AnalyzeRequest(BaseModel):
     job_input: str
     posts: Optional[List[Dict[str, Any]]] = None
     save_history: bool = True
+    use_xiaohongshu: bool = False  # 是否使用小红书实时数据
 
 
 class FavoriteRequest(BaseModel):
@@ -41,11 +56,68 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/api/status")
+async def get_status():
+    """获取系统状态，包括小红书连接状态。异常时也返回可解析JSON。"""
+    try:
+        mcp_status = await check_mcp_status()
+        xhs_data = mcp_status.get("data", {})
+    except Exception as exc:
+        xhs_data = {
+            "is_logged_in": False,
+            "username": "",
+            "playwright_available": False,
+            "cookies_loaded": False,
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "version": "0.3.0",
+        "xiaohongshu": {
+            "available": xhs_data.get("is_logged_in", False),
+            "username": xhs_data.get("username", ""),
+            "playwright_available": xhs_data.get("playwright_available", False),
+            "cookies_loaded": xhs_data.get("cookies_loaded", False),
+            "cookies_source": xhs_data.get("cookies_source", "unknown"),
+            "error": xhs_data.get("error", ""),
+        },
+    }
+
+
 @app.post("/api/analyze")
-def analyze(req: AnalyzeRequest):
+async def analyze(req: AnalyzeRequest):
     job = parse_job(req.job_input)
-    sample = load_sample_posts()
-    posts = req.posts if req.posts is not None else sample.get(req.job_input, [])
+    
+    # 确定数据源
+    posts = []
+    data_source = "sample"
+    
+    if req.posts is not None:
+        # 用户提供了自定义数据
+        posts = req.posts
+        data_source = "custom"
+    elif req.use_xiaohongshu:
+        # 使用小红书实时数据。任何异常都回退样本，避免前端 fetch 失败。
+        print(f"[API] 使用小红书搜索: {req.job_input}")
+        try:
+            raw_posts = await search_xiaohongshu(req.job_input, limit=10)
+            if raw_posts:
+                posts = transform_posts_for_platform(raw_posts)
+                data_source = "xiaohongshu"
+            else:
+                sample = load_sample_posts()
+                posts = sample.get(req.job_input, [])
+                data_source = "sample_fallback"
+        except Exception as exc:
+            print(f"[API] 小红书搜索异常，已回退样本: {exc}")
+            sample = load_sample_posts()
+            posts = sample.get(req.job_input, [])
+            data_source = "sample_fallback"
+    else:
+        # 使用内置样本数据
+        sample = load_sample_posts()
+        posts = sample.get(req.job_input, [])
+    
     report = build_report(job, posts)
 
     history_id = None
@@ -53,12 +125,48 @@ def analyze(req: AnalyzeRequest):
         item = append_history(req.job_input, report)
         history_id = item["id"]
 
-    return {"report": asdict(report), "history_id": history_id}
+    return {
+        "report": asdict(report), 
+        "history_id": history_id,
+        "meta": {
+            "data_source": data_source,
+            "posts_count": len(posts)
+        }
+    }
 
 
 @app.get("/api/samples")
 def samples():
     return {"jobs": list(load_sample_posts().keys())}
+
+
+@app.get("/api/xiaohongshu/search")
+async def xiaohongshu_search(keyword: str, limit: int = 10):
+    """
+    直接搜索小红书
+    
+    Args:
+        keyword: 搜索关键词
+        limit: 返回数量
+        
+    Returns:
+        搜索结果列表
+    """
+    try:
+        posts = await search_xiaohongshu(keyword, limit)
+    except Exception as exc:
+        posts = []
+        return {
+            "keyword": keyword,
+            "count": 0,
+            "posts": posts,
+            "error": str(exc),
+        }
+    return {
+        "keyword": keyword,
+        "count": len(posts),
+        "posts": posts,
+    }
 
 
 @app.get("/api/history")
@@ -298,6 +406,11 @@ def home():
         <button class="btn" id="runBtn">生成岗位报告</button>
       </div>
       <div class="tool-row">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:#fff;">
+          <input type="checkbox" id="useXiaohongshu" style="width:18px;height:18px;" />
+          使用小红书实时数据
+        </label>
+        <button class="btn-ghost" id="checkXhsBtn">检查小红书连接</button>
         <button class="btn-ghost" id="favBtn">收藏当前报告</button>
         <button class="btn-ghost" id="exportJsonBtn">导出 JSON</button>
         <button class="btn-ghost" id="exportMdBtn">导出 Markdown</button>
@@ -504,17 +617,70 @@ async function refreshFavorites() {
 async function run() {
   const jobInput = document.getElementById('jobInput').value.trim();
   if (!jobInput) return;
-  setStatus('正在生成报告...');
-  const res = await fetch('/api/analyze', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({job_input: jobInput, save_history: true})
-  });
-  const payload = await res.json();
-  currentHistoryId = payload.history_id;
-  render(payload.report);
-  setStatus(`生成完成，history_id=${currentHistoryId}`);
-  await refreshHistory();
+  
+  const useXiaohongshu = document.getElementById('useXiaohongshu').checked;
+  
+  if (useXiaohongshu) {
+    setStatus('正在搜索小红书实时数据...');
+  } else {
+    setStatus('正在生成报告...');
+  }
+  
+  try {
+    const res = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        job_input: jobInput,
+        save_history: true,
+        use_xiaohongshu: useXiaohongshu
+      })
+    });
+
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const err = await res.json();
+        detail = err.detail || detail;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+
+    const payload = await res.json();
+    if (!payload.report) {
+      throw new Error('服务返回结果缺失');
+    }
+
+    currentHistoryId = payload.history_id;
+    render(payload.report);
+
+    const sourceText = payload.meta?.data_source === 'xiaohongshu' ? '(小红书实时)' :
+                       payload.meta?.data_source === 'sample_fallback' ? '(小红书失败,使用样本)' : '';
+    setStatus(`生成完成${sourceText}，history_id=${currentHistoryId}`);
+    await refreshHistory();
+  } catch (e) {
+    setStatus(`生成失败: ${e.message || '未知错误'}`);
+  }
+}
+
+async function checkXiaohongshuStatus() {
+  setStatus('检查小红书连接...');
+  try {
+    const res = await fetch('/api/status');
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const xhs = data?.xiaohongshu || {};
+    if (xhs.available === true) {
+      setStatus(`✅ 小红书已连接 (${xhs.username || 'xiaohongshu'})，cookies来源: ${xhs.cookies_source || 'unknown'}`);
+    } else {
+      const why = xhs.error ? `，原因: ${xhs.error}` : '';
+      setStatus(`❌ 小红书未连接（playwright=${xhs.playwright_available ? 'ok' : 'missing'}，cookies=${xhs.cookies_loaded ? 'ok' : 'missing'}）${why}`);
+    }
+  } catch (e) {
+    setStatus(`❌ 无法检查状态: ${e.message || '网络错误'}`);
+  }
 }
 
 async function loadFromHistory(id) {
@@ -574,6 +740,7 @@ function exportMarkdown() {
 }
 
 document.getElementById('runBtn').onclick = run;
+document.getElementById('checkXhsBtn').onclick = checkXiaohongshuStatus;
 document.getElementById('favBtn').onclick = favoriteCurrent;
 document.getElementById('exportJsonBtn').onclick = exportJson;
 document.getElementById('exportMdBtn').onclick = exportMarkdown;
