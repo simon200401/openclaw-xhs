@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: openclaw-xhs
+    name: openclaw-xhs-simon200401
     runtime: python
     plan: free
     autoDeploy: true
